@@ -94,7 +94,9 @@ where
         return Err(VerifierError::EmptyTraces);
     }
     // We verify the proof shape early to return error and prevent later panics
+    let __p0 = crate::hasher::meter::now();
     let layouts = verify_proof_shape::<SC>(mvk, proof)?;
+    crate::hasher::meter::phase(0, __p0);
 
     let mut trace_id_to_air_id: Vec<usize> = (0..num_airs).collect();
     trace_id_to_air_id.sort_by_key(|&air_id| {
@@ -165,6 +167,7 @@ where
         .iter()
         .map(|&air_id| trace_vdata[air_id].as_ref().unwrap().log_height as isize - l_skip as isize)
         .collect();
+    let __p1 = crate::hasher::meter::now();
     let r = verify_zerocheck_and_logup::<SC, TS>(
         transcript,
         mvk,
@@ -175,6 +178,7 @@ where
         &n_per_trace,
         &omega_skip_pows,
     )?;
+    crate::hasher::meter::phase(1, __p1);
 
     let need_rot_per_trace = trace_id_to_air_id
         .iter()
@@ -196,6 +200,7 @@ where
         }
     }
 
+    let __p2 = crate::hasher::meter::now();
     let u_prism = verify_stacked_reduction::<SC, TS>(
         transcript,
         stacking_proof,
@@ -207,6 +212,7 @@ where
         &r,
         &omega_skip_pows,
     )?;
+    crate::hasher::meter::phase(2, __p2);
 
     let (&u0, u_rest) = u_prism.split_first().unwrap();
     let u_cube = u0
@@ -223,6 +229,7 @@ where
         commits.extend(&trace_vdata[air_id].as_ref().unwrap().cached_commitments);
     }
 
+    let __p3 = crate::hasher::meter::now();
     verify_whir::<SC, TS>(
         transcript,
         config,
@@ -231,6 +238,7 @@ where
         &commits,
         &u_cube,
     )?;
+    crate::hasher::meter::phase(3, __p3);
 
     Ok(())
 }

@@ -686,11 +686,24 @@ mod blake3_roundtrip_tests {
     /// round trip already passes). This is the function the packed poseidon2 fast path used to
     /// shortcut, so its GENERIC branch has barely been exercised for BabyBear-shaped digests.
     fn run<H: MerkleHasher<F = TF, Digest = TDigest>>(hasher: &H, label: &str) {
+        // ⚠️ The original shape only: width 2, height 16, rows_per_query 2. `rows_per_query = 2`
+        // runs the query-stride interleaving phase EXACTLY ONCE, so a bug in that phase past its
+        // first iteration cannot show up. The real proof fails at path_depth=22.
+        for (h, rpq) in [(16usize, 2usize), (64, 4), (256, 8), (1024, 16), (4096, 32)] {
+            run_shape(hasher, label, h, rpq);
+        }
+    }
+
+    /// Bisects the two axes the original test held fixed: TREE DEPTH and, more importantly,
+    /// ROWS_PER_QUERY — which is the number of query-stride-interleaved layers built before the
+    /// plain binary ones. If blake3 diverges only for rpq > 2, the fault is in that interleaving.
+    fn run_shape<H: MerkleHasher<F = TF, Digest = TDigest>>(
+        hasher: &H, label: &str, height: usize, rows_per_query: usize,
+    ) {
         let width = 2usize;
-        let height = 16usize;
         let vals = (0..(width * height) as u32).map(TF::from_u32).collect_vec();
         let eval_matrix = ColMajorMatrix::new(vals, height);
-        let tree = rs_encode_and_merkle_cpu(hasher, 0, 1, &eval_matrix, 2);
+        let tree = rs_encode_and_merkle_cpu(hasher, 0, 1, &eval_matrix, rows_per_query);
         let root = tree.root().expect("root");
         let stride = tree.query_stride();
         // Only the ROOT and the path structure are checked here: if the prover's own tree is
@@ -704,17 +717,17 @@ mod blake3_roundtrip_tests {
             let folded: Vec<TDigest> = layer.chunks_exact(2)
                 .map(|p| hasher.compress(p[0], p[1])).collect();
             let next = &tree.digest_layers[li + 1];
-            assert_eq!(folded.len(), next.len(), "{label}: layer {li} size mismatch");
+            assert_eq!(folded.len(), next.len(), "{label} h={height} rpq={rows_per_query}: layer {li} size mismatch");
             for (j, (a, b)) in folded.iter().zip(next.iter()).enumerate() {
-                assert_eq!(a, b, "{label}: layer {li}->{} node {j} DIVERGES (tree not self-consistent)", li + 1);
+                assert_eq!(a, b, "{label} h={height} rpq={rows_per_query}: layer {li}->{} node {j} DIVERGES", li + 1);
             }
         }
-        println!("{label}: tree is self-consistent across {} layers", tree.digest_layers.len());
+        println!("{label} h={height} rpq={rows_per_query}: self-consistent, {} layers", tree.digest_layers.len());
         for q in 0..stride.min(4) {
             let proof = tree.query_merkle_proof(q).expect("proof");
             let leaf = tree.digest_layers[0][q];
             merkle_verify(hasher, root, q as u32, leaf, &proof)
-                .unwrap_or_else(|e| panic!("{label}: query {q} FAILED: {e:?} (proof_len={}, stride={})", proof.len(), stride));
+                .unwrap_or_else(|e| panic!("{label} h={height} rpq={rows_per_query}: query {q} FAILED: {e:?} (proof_len={}, stride={})", proof.len(), stride));
         }
     }
 

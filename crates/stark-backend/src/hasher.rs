@@ -16,6 +16,53 @@ use {
 ///
 /// The `MerkleHasher` is parameterized over the base field `F` used as leaves,
 /// and provides a `Digest` type for internal nodes.
+
+/// [sbf-meter] CU accounting for OpenVM's hashing, mirroring the instrument already used on the
+/// risc0 side so the two verifiers can be compared on one axis.
+///
+/// ⭐ THE NUMBER THIS EXISTS FOR: OpenVM verifies a real proof in 316,632,277 CU at poseidon2, and
+/// RISC Zero in 406,353,121 — so OpenVM's verifier is the leaner of the two. But risc0 drops to
+/// 12,834,936 by putting blake3 on the `sol_blake3` syscall, a 31.7x gain, and whether OpenVM would
+/// gain the SAME factor depends entirely on WHAT FRACTION OF ITS BILL IS HASHING. At 92% blake3
+/// leaves it at ~27M and it loses; at 97% it lands at ~11.7M and it wins. Nobody has measured it,
+/// and the prover work needed to give OpenVM blake3 is only worth doing on the winning side of that
+/// line.
+///
+/// Three words at a fixed runtime-heap address, because the SBF loader rejects writable statics:
+/// [hash_cu, hash_calls, compress_calls].
+#[cfg(target_os = "solana")]
+pub mod meter {
+    extern "C" {
+        fn sol_remaining_compute_units() -> u64;
+    }
+    const BASE: *mut u64 = 0x300004000 as *mut u64;
+    #[inline(always)]
+    pub fn now() -> u64 { unsafe { sol_remaining_compute_units() } }
+    #[inline(always)]
+    pub fn account(start: u64, is_compress: bool) {
+        unsafe {
+            *BASE += start.saturating_sub(now());
+            *BASE.add(1) += 1;
+            if is_compress { *BASE.add(2) += 1; }
+        }
+    }
+    /// Phase spans start at word 4: [shape, zerocheck_logup, gkr, stacked, whir], CU each.
+    #[inline(always)]
+    pub fn phase(slot: usize, start: u64) {
+        unsafe { *BASE.add(4 + slot) += start.saturating_sub(now()); }
+    }
+    pub fn read() -> [u64; 12] { unsafe { core::array::from_fn(|i| *BASE.add(i)) } }
+    pub fn reset() { unsafe { for i in 0..12 { *BASE.add(i) = 0; } } }
+}
+#[cfg(not(target_os = "solana"))]
+pub mod meter {
+    #[inline(always)] pub fn now() -> u64 { 0 }
+    #[inline(always)] pub fn account(_s: u64, _c: bool) {}
+    #[inline(always)] pub fn phase(_slot: usize, _start: u64) {}
+    pub fn read() -> [u64; 12] { [0; 12] }
+    pub fn reset() {}
+}
+
 pub trait MerkleHasher: 'static + Clone + Send + Sync {
     type F: Field;
     type Digest: 'static + Copy + Send + Sync;
@@ -68,11 +115,17 @@ where
     type Digest = Digest;
 
     fn hash_slice(&self, vals: &[Self::F]) -> Self::Digest {
-        self.hash.hash_slice(vals)
+        let __t = meter::now();
+        let r = self.hash.hash_slice(vals);
+        meter::account(__t, false);
+        r
     }
 
     fn compress(&self, left: Self::Digest, right: Self::Digest) -> Self::Digest {
-        self.compress.compress([left, right])
+        let __t = meter::now();
+        let r = self.compress.compress([left, right]);
+        meter::account(__t, true);
+        r
     }
 }
 

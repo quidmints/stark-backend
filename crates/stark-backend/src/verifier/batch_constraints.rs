@@ -95,7 +95,13 @@ pub fn verify_zerocheck_and_logup<SC: StarkProtocolConfig, TS: FiatShamirTranscr
     let mut q_xi_claim = alpha_logup;
     if total_interactions > 0 {
         (p_xi_claim, q_xi_claim, xi) =
-            verify_gkr::<SC, TS>(gkr_proof, transcript, l_skip + n_logup)?;
+            {
+                // [sub-meter] phase 4: the logup/GKR half of the 25.85M term.
+                let __g = crate::hasher::meter::now();
+                let __r = verify_gkr::<SC, TS>(gkr_proof, transcript, l_skip + n_logup)?;
+                crate::hasher::meter::phase(4, __g);
+                __r
+            };
         debug_assert_eq!(xi.len(), l_skip + n_logup);
     } else if gkr_proof.q0_claim != SC::EF::ONE {
         return Err(GkrVerificationError::InvalidZeroRoundValue {
@@ -142,6 +148,8 @@ pub fn verify_zerocheck_and_logup<SC: StarkProtocolConfig, TS: FiatShamirTranscr
         cur_mu_pow *= mu;
     }
 
+    // [sub-meter] phase 5 opens here: the univariate + multilinear sumcheck rounds.
+    let __sc = crate::hasher::meter::now();
     // 5. Univariate sumcheck round
     for &coeff in univariate_round_coeffs {
         transcript.observe_ext(coeff);
@@ -263,6 +271,12 @@ pub fn verify_zerocheck_and_logup<SC: StarkProtocolConfig, TS: FiatShamirTranscr
         r_rev_prod *= rs[i];
     }
 
+    crate::hasher::meter::phase(5, __sc);
+    // [sub-meter] phase 6 opens here: section 9, the per-trace DAG node evaluation. This is the
+    // one that scales with AIR COUNT — the structural term. If the 25.85M lives here rather than
+    // in the sumcheck, the floor is the bus, exactly as claimed; if it lives in the sumcheck,
+    // the floor is arithmetic and MIGHT be optimisable.
+    let __ev = crate::hasher::meter::now();
     // 9. Compute the interaction/constraint evals and their hash
     let mut interactions_evals = Vec::new(); // len = 2 * num_traces
     let mut constraints_evals = Vec::new(); // len = num_traces
@@ -395,6 +409,7 @@ pub fn verify_zerocheck_and_logup<SC: StarkProtocolConfig, TS: FiatShamirTranscr
         .zip(mu.powers())
         .map(|(x, y)| *x * y)
         .sum::<SC::EF>();
+    crate::hasher::meter::phase(6, __ev);
     if cur_sum != evaluated_claim {
         return Err(BatchConstraintError::InconsistentClaims);
     }
