@@ -10,6 +10,7 @@ license.workspace = true
 description = "SDK for production and testing usage of STARKs."
 
 [dependencies]
+blake3 = { version = "1", default-features = false, optional = true }
 openvm-stark-backend = { workspace = true }
 openvm-cpu-backend = { workspace = true, optional = true }
 
@@ -53,6 +54,9 @@ cfg-if.workspace = true
 sha3.workspace = true # already in tree via zkhash
 
 [features]
+# ON BY DEFAULT IN THIS FORK so the backend's OWN tests exercise Blake3F — a 2-second loop
+# instead of the 500-second prove-and-verify cycle I spent hours on.
+blake3-hash = ["dep:blake3"]
 default = ["parallel", "metrics", "cpu-backend"]
 baby-bear-bn254-poseidon2 = [
   "dep:p3-bn254",

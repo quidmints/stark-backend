@@ -618,3 +618,109 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use itertools::Itertools;
+    use p3_baby_bear::BabyBear;
+    use p3_field::{extension::BinomialExtensionField, BasedVectorSpace, PrimeCharacteristicRing};
+    use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+
+    use super::*;
+    use crate::{hasher::Hasher as MHasher, hasher::MerkleHasher, prover::ColMajorMatrix,
+                verifier::whir::merkle_verify};
+
+    type F = BabyBear;
+    type EF = BinomialExtensionField<BabyBear, 4>;
+    type Digest = [F; 8];
+
+    /// ⭐ THE TEST THAT SHOULD HAVE EXISTED BEFORE THE 500-SECOND PROVE CYCLES.
+    ///
+    /// Prover commits a matrix; verifier walks one Merkle path; SAME hasher. Built directly from
+    /// the permutation rather than through `BabyBearPoseidon2Config`, because the config route
+    /// drags in `stark-sdk` as a dev-dependency, which resolves a SECOND `stark-backend` and makes
+    /// the `StarkProtocolConfig` bound unsatisfiable here. The hasher is what matters, not the
+    /// config wrapper.
+    ///
+    /// ⚠️ THE LEAF IS THE SUSPECT: leaves come from `row_iter`, which pads to
+    /// `height.next_power_of_two()` with `EF::ZERO`. A hasher that treats a padded row differently
+    /// from the verifier's reconstruction shows up ONLY as a full-depth value mismatch — exactly
+    /// the `path_depth=22, idx_after=0` signature seen in a real blake3 proof.
+    fn run_roundtrip<H: MerkleHasher<F = F, Digest = Digest>>(hasher: &H, label: &str) {
+        let vals = (0..32u32).map(EF::from_u32).collect_vec();
+        let matrix = ColMajorMatrix::new(vals, 16);
+        let rows_per_query = 2usize;
+        let tree = MerkleTree::<EF, Digest>::new(hasher, matrix.clone(), rows_per_query)
+            .unwrap_or_else(|e| panic!("{label}: commit failed: {e:?}"));
+        let root = tree.root().expect("root");
+        let stride = tree.query_stride();
+        for q in 0..stride {
+            let proof = tree.query_merkle_proof(q).expect("proof");
+            let leaf_hashes: Vec<Digest> = (0..rows_per_query)
+                .map(|i| {
+                    let r = q + i * stride;
+                    let input: Vec<F> = MerkleTree::<EF, Digest>::row_iter(&matrix, r)
+                        .flat_map(|ef| ef.as_basis_coefficients_slice().to_vec())
+                        .collect();
+                    hasher.hash_slice(&input)
+                })
+                .collect();
+            let leaf = hasher.tree_compress(leaf_hashes);
+            merkle_verify(hasher, root, q as u32, leaf, &proof)
+                .unwrap_or_else(|e| panic!("{label}: query {q} FAILED: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn roundtrip_poseidon2_control() {
+        let perm = p3_baby_bear::default_babybear_poseidon2_16();
+        let hasher = MHasher::<F, Digest, _, _>::new(
+            PaddingFreeSponge::<_, 16, 8, 8>::new(perm.clone()),
+            TruncatedPermutation::<_, 2, 8, 16>::new(perm),
+        );
+        run_roundtrip(&hasher, "poseidon2");
+    }
+
+    /// The SAME Blake3F as the sdk's, defined locally so this test needs no dev-dependency and no
+    /// cargo feature — which is what kept the fast loop out of reach.
+    #[derive(Clone, Copy, Debug)]
+    struct Blake3F;
+
+    fn b3(data: &[u8]) -> [u8; 32] {
+        *blake3::hash(data).as_bytes()
+    }
+    fn to_digest(b: [u8; 32]) -> Digest {
+        const P: u32 = 0x78000001;
+        core::array::from_fn(|i| {
+            let w = u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+            <F as p3_field::integers::QuotientMap<u32>>::from_int(w % P)
+        })
+    }
+    impl p3_symmetric::CryptographicHasher<F, Digest> for Blake3F {
+        fn hash_iter<I: IntoIterator<Item = F>>(&self, input: I) -> Digest {
+            let mut buf = Vec::new();
+            for f in input {
+                buf.extend_from_slice(&p3_field::PrimeField32::as_canonical_u32(&f).to_le_bytes());
+            }
+            to_digest(b3(&buf))
+        }
+    }
+    impl p3_symmetric::PseudoCompressionFunction<Digest, 2> for Blake3F {
+        fn compress(&self, input: [Digest; 2]) -> Digest {
+            let mut buf = [0u8; 64];
+            for (k, d) in input.iter().enumerate() {
+                for (i, f) in d.iter().enumerate() {
+                    buf[k * 32 + i * 4..k * 32 + i * 4 + 4]
+                        .copy_from_slice(&p3_field::PrimeField32::as_canonical_u32(f).to_le_bytes());
+                }
+            }
+            to_digest(b3(&buf))
+        }
+    }
+
+    #[test]
+    fn roundtrip_blake3() {
+        let hasher = MHasher::<F, Digest, _, _>::new(Blake3F, Blake3F);
+        run_roundtrip(&hasher, "blake3");
+    }
+}

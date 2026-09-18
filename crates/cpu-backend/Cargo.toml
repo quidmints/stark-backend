@@ -32,6 +32,7 @@ rustc-hash.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+blake3 = "1"
 openvm-stark-backend = { path = "../stark-backend", default-features = false, features = ["test-utils"] }
 openvm-stark-sdk = { path = "../stark-sdk", default-features = false, features = ["cpu-backend"] }
 openvm-backend-tests = { path = "../backend-tests", default-features = false }

@@ -244,8 +244,23 @@ where
     F: TwoAdicField + Ord + 'static,
     H: MerkleHasher<F = F>,
 {
+    // ⛔ THE POSEIDON2 FAST PATH IS SELECTED BY *TYPE*, NOT BY THE HASHER YOU PASSED.
+    // The TypeId test below matches `F = BabyBear, Digest = [BabyBear; 8]` — which a blake3
+    // config ALSO matches, since blake3's 32 bytes map onto exactly 8 BabyBear limbs. So the
+    // prover silently committed with poseidon2 while the verifier checked with blake3, and the
+    // only symptom was `WhirError(MerkleVerify)`: a proof that verifies against neither hash.
+    //
+    // 🔑 THIS IS WHAT THE `MerkleHasher` DOCSTRING WARNS ABOUT — "prover backends may use
+    // independent but functionally equivalent implementations". Equivalent is doing the work in
+    // that sentence: the shortcut is only equivalent while the hash IS poseidon2.
+    // 🔴 UNCONDITIONAL. A feature-gated guard here is how the bug survived: this
+    // file had THREE copies at different indentation, my edit matched two, and the third
+    // kept the packed poseidon2 path alive. Leaves were then blake3 and LAYERS poseidon2,
+    // which shows up only as a full-depth Merkle mismatch far away in a real proof.
+    let _use_packed = false;
     use std::any::TypeId;
-    if TypeId::of::<F>() == TypeId::of::<BabyBear>()
+    if _use_packed
+        && TypeId::of::<F>() == TypeId::of::<BabyBear>()
         && TypeId::of::<H::Digest>() == TypeId::of::<[BabyBear; 8]>()
     {
         // SAFETY: TypeId checks guarantee H::Digest = [BabyBear; 8].
@@ -347,8 +362,24 @@ where
     let num_leaves = codeword_height.next_power_of_two();
     let rm_vals = &rm_result.values;
     let row_hashes: Vec<H::Digest> = tracing::info_span!("row_hash").in_scope(|| {
+        // ⛔ THE POSEIDON2 FAST PATH IS SELECTED BY *TYPE*, NOT BY THE HASHER YOU PASSED.
+        // The TypeId test below matches `F = BabyBear, Digest = [BabyBear; 8]` — which a blake3
+        // config ALSO matches, since blake3's 32 bytes map onto exactly 8 BabyBear limbs. So the
+        // prover silently committed with poseidon2 while the verifier checked with blake3, and the
+        // only symptom was `WhirError(MerkleVerify)`: a proof that verifies against neither hash.
+        //
+        // 🔑 THIS IS WHAT THE `MerkleHasher` DOCSTRING WARNS ABOUT — "prover backends may use
+        // independent but functionally equivalent implementations". Equivalent is doing the work in
+        // that sentence: the shortcut is only equivalent while the hash IS poseidon2.
+        // 🔴 THIS VENDORED COPY IS THE BLAKE3 BUILD: the packed path is OFF unconditionally.
+        // Gating it behind a cargo feature does not work here — openvm-stark-sdk depends on this
+        // crate too, so a `[patch]` entry and a direct path dependency collide, and `[patch]`
+        // ignores features. Turning it off outright is the honest form for a fork that exists to
+        // measure one thing. The poseidon2 numbers were already taken from the UNPATCHED crate.
+        let _use_packed = false;
         use std::any::TypeId;
-        if TypeId::of::<F>() == TypeId::of::<BabyBear>()
+        if _use_packed
+            && TypeId::of::<F>() == TypeId::of::<BabyBear>()
             && TypeId::of::<H::Digest>() == TypeId::of::<[BabyBear; 8]>()
         {
             let bb_vals: &[BabyBear] = unsafe {
@@ -631,5 +662,102 @@ mod tests {
 
         // Out of bounds
         assert!(tree.get_opened_rows(2).is_err());
+    }
+}
+
+#[cfg(test)]
+mod blake3_roundtrip_tests {
+    use itertools::Itertools;
+    use openvm_stark_backend::{
+        hasher::{Hasher as MHasher, MerkleHasher},
+        verifier::whir::merkle_verify,
+    };
+    use p3_baby_bear::{default_babybear_poseidon2_16, BabyBear};
+    use p3_field::PrimeCharacteristicRing;
+    use openvm_stark_backend::p3_symmetric::{self, PaddingFreeSponge, TruncatedPermutation};
+
+    use super::*;
+
+    type TF = BabyBear;
+    type TDigest = [TF; 8];
+
+    /// ⭐ THE TREE THAT ACTUALLY FAILS. `path_depth=22` means 2^22 leaves — the main CODEWORD tree,
+    /// built here by `rs_encode_and_merkle_cpu`, NOT the stacked-PCS `MerkleTree` (whose blake3
+    /// round trip already passes). This is the function the packed poseidon2 fast path used to
+    /// shortcut, so its GENERIC branch has barely been exercised for BabyBear-shaped digests.
+    fn run<H: MerkleHasher<F = TF, Digest = TDigest>>(hasher: &H, label: &str) {
+        let width = 2usize;
+        let height = 16usize;
+        let vals = (0..(width * height) as u32).map(TF::from_u32).collect_vec();
+        let eval_matrix = ColMajorMatrix::new(vals, height);
+        let tree = rs_encode_and_merkle_cpu(hasher, 0, 1, &eval_matrix, 2);
+        let root = tree.root().expect("root");
+        let stride = tree.query_stride();
+        // Only the ROOT and the path structure are checked here: if the prover's own tree is
+        // self-consistent, a path opened from it must fold back to its own root. A failure means
+        // the tree builder and the path walker disagree — which is exactly the observed symptom.
+        // BISECT: is the TREE self-consistent, or is the PATH WALK wrong? Fold each stored layer
+        // into the next with the same `compress` and compare. If this holds, the tree is fine and
+        // the disagreement is in how the path is opened/walked.
+        for (li, layer) in tree.digest_layers.iter().enumerate() {
+            if layer.len() < 2 { continue; }
+            let folded: Vec<TDigest> = layer.chunks_exact(2)
+                .map(|p| hasher.compress(p[0], p[1])).collect();
+            let next = &tree.digest_layers[li + 1];
+            assert_eq!(folded.len(), next.len(), "{label}: layer {li} size mismatch");
+            for (j, (a, b)) in folded.iter().zip(next.iter()).enumerate() {
+                assert_eq!(a, b, "{label}: layer {li}->{} node {j} DIVERGES (tree not self-consistent)", li + 1);
+            }
+        }
+        println!("{label}: tree is self-consistent across {} layers", tree.digest_layers.len());
+        for q in 0..stride.min(4) {
+            let proof = tree.query_merkle_proof(q).expect("proof");
+            let leaf = tree.digest_layers[0][q];
+            merkle_verify(hasher, root, q as u32, leaf, &proof)
+                .unwrap_or_else(|e| panic!("{label}: query {q} FAILED: {e:?} (proof_len={}, stride={})", proof.len(), stride));
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Blake3F;
+    fn b3(d: &[u8]) -> [u8; 32] { *blake3::hash(d).as_bytes() }
+    fn to_digest(b: [u8; 32]) -> TDigest {
+        const P: u32 = 0x78000001;
+        core::array::from_fn(|i| {
+            let w = u32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]]);
+            <TF as p3_field::integers::QuotientMap<u32>>::from_int(w % P)
+        })
+    }
+    impl openvm_stark_backend::p3_symmetric::CryptographicHasher<TF, TDigest> for Blake3F {
+        fn hash_iter<I: IntoIterator<Item = TF>>(&self, input: I) -> TDigest {
+            let mut buf = Vec::new();
+            for f in input { buf.extend_from_slice(&p3_field::PrimeField32::as_canonical_u32(&f).to_le_bytes()); }
+            to_digest(b3(&buf))
+        }
+    }
+    impl openvm_stark_backend::p3_symmetric::PseudoCompressionFunction<TDigest, 2> for Blake3F {
+        fn compress(&self, input: [TDigest; 2]) -> TDigest {
+            let mut buf = [0u8; 64];
+            for (k, d) in input.iter().enumerate() {
+                for (i, f) in d.iter().enumerate() {
+                    buf[k*32+i*4..k*32+i*4+4].copy_from_slice(&p3_field::PrimeField32::as_canonical_u32(f).to_le_bytes());
+                }
+            }
+            to_digest(b3(&buf))
+        }
+    }
+
+    #[test]
+    fn codeword_tree_poseidon2_control() {
+        let perm = default_babybear_poseidon2_16();
+        let h = MHasher::<TF, TDigest, _, _>::new(
+            PaddingFreeSponge::<_, 16, 8, 8>::new(perm.clone()),
+            TruncatedPermutation::<_, 2, 8, 16>::new(perm));
+        run(&h, "poseidon2");
+    }
+
+    #[test]
+    fn codeword_tree_blake3() {
+        run(&MHasher::<TF, TDigest, _, _>::new(Blake3F, Blake3F), "blake3");
     }
 }

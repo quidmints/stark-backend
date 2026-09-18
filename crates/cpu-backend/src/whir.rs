@@ -388,7 +388,18 @@ where
 
     // Phase 1: Leaf hashing — packed SIMD for BabyBear, allocation-free fallback otherwise.
     let row_hashes: Vec<SC::Digest> = tracing::info_span!("merkle_tree").in_scope(|| {
-        if TypeId::of::<SC::F>() == TypeId::of::<BabyBear>()
+        // ⛔ SELECTED BY TYPE, NOT BY THE HASHER. See the same guard in `merkle.rs`: a blake3
+        // config has F = BabyBear and Digest = [BabyBear; 8] too, so it matches this test and the
+        // prover would commit with poseidon2 while the verifier checks with blake3. The only
+        // symptom is `WhirError(MerkleVerify)`.
+        // 🔴 THIS VENDORED COPY IS THE BLAKE3 BUILD: the packed path is OFF unconditionally.
+        // Gating it behind a cargo feature does not work here — openvm-stark-sdk depends on this
+        // crate too, so a `[patch]` entry and a direct path dependency collide, and `[patch]`
+        // ignores features. Turning it off outright is the honest form for a fork that exists to
+        // measure one thing. The poseidon2 numbers were already taken from the UNPATCHED crate.
+        let _use_packed = false;
+        if _use_packed
+            && TypeId::of::<SC::F>() == TypeId::of::<BabyBear>()
             && TypeId::of::<SC::Digest>() == TypeId::of::<[BabyBear; 8]>()
         {
             // SAFETY: BinomialExtensionField<BabyBear, 4> is #[repr(C)] with value: [BabyBear; 4],

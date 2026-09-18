@@ -49,6 +49,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 mimalloc = { version = "0.1.43", optional = true }
 
 [dev-dependencies]
+blake3 = "1"
 openvm-stark-backend = { path = ".", default-features = false, features = ["test-utils"] }
 openvm-stark-sdk = { path = "../stark-sdk", default-features = false } # dev-dependency is not circular
 openvm-backend-tests = { path = "../backend-tests", default-features = false }
