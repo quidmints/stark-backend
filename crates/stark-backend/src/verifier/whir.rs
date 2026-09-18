@@ -405,6 +405,16 @@ where
         idx >>= 1;
     }
     if root != cur {
+        // [diag] The failure is silent otherwise: MerkleVerify says "a path did not match" and
+        // nothing about WHICH side is wrong. Printing both ends the guessing about Blake3F.
+        // `Digest` has no Debug bound here, so report the SHAPE instead: which check failed and
+        // how deep. A depth-0 failure means the leaf hash itself is wrong (hash_slice); a deeper
+        // one means the compress chain diverges.
+        #[cfg(not(target_os = "solana"))]
+        eprintln!(
+            "[merkle_verify MISMATCH] path_depth={} idx_after={}",
+            merkle_proof.len(), idx
+        );
         Err(VerifyWhirError::MerkleVerify)
     } else {
         Ok(())
